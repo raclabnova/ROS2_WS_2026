@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""
+mission_ileri_kategori.py
+--------------------
+TEKNOFEST İleri Kategori Ön Eleme Görevi
+
+REVİZYON NOTLARI:
+  ... (öncekiler aynı, TURN_SPEED=0.3 dahil) ...
+  8) *** YENİ — CIRCLE ARTIK 90° DÖNÜŞLE AYNI MEKANİZMAYI KULLANIYOR (KRİTİK) ***
+     Önceki CIRCLE mekanizması (ang_z=0 + heading PID'in hareketli bir
+     dynamic_heading hedefini "kovalaması") güvenilmez çıktı: loglarda
+     hedef (hedef_sp) bir yöne kayarken aracın gerçek heading'i (mevcut_
+     heading) BAŞKA yöne gidiyordu — yani heading PID hedefi hiç
+     yakalayamıyordu. Bu da gerçek dönüşün ne zaman 360°'ye ulaştığını
+     belirsizleştirdi, araç 3-4-5 tur gibi süren tutarsız bir dönüş
+     sergiledi.
+     90° dönüşler ise problemsiz çalışıyor çünkü heading PID'e hiç
+     güvenmiyorlar — doğrudan sabit bir ang_z komutu veriyorlar ve bitişi
+     GERÇEK ölçülen accumulated_yaw ile debounce'lu (TURN_CONFIRM_TICKS
+     ardışık tick) doğruluyorlar.
+     Çözüm: CIRCLE artık AYNI mekanizmayı kullanıyor — ang_z=0 yerine
+     sabit CIRCLE_ANG_SPEED komutu doğrudan gönderiliyor (heading PID
+     bypass ediliyor, tıpkı turn'lerde olduğu gibi), ve bitiş şartı da
+     aynı debounce mantığıyla (abs(accumulated_yaw) >= 355°, ardışık
+     TURN_CONFIRM_TICKS tick boyunca) kontrol ediliyor. Artık daire de
+     turn'ler kadar güvenilir olmalı.
+     heading_setpoint / dynamic_heading artık CIRCLE sırasında hiç
+     kullanılmıyor — sadece dönüş bitince (turn'lerde olduğu gibi)
+     bulunduğu son açıya kilitleniyor.
+"""
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32, Int32MultiArray
+from geometry_msgs.msg import Twist
+import time
+import sys  # Node'u tamamen durdurmak için eklendi
+
+# --- GÖREV AYARLARI ---
+TARGET_DEPTH         = 0.60
+DEPTH_HOLD_MARGIN    = 0.15
+FORWARD_SPEED        = 0.5
+FORWARD_TIME         = 3.0
+FORWARD_TIME_LEG3    = 3.0
+HEADING_TOLERANCE    = 8.0
+SETTLE_TIME          = 2.0
+TURN_SPEED           = 0.5
+TURN_OFFSET_RIGHT    = -90.0
+
+# --- DÖNÜŞ DOĞRULAMA (debounce) AYARLARI ---
+TURN_CONFIRM_TICKS   = 6         # 0.05s * 6 = 0.3s boyunca şartlar sağlanmalı
+
+# --- DAİRE AYARLARI ---
+CIRCLE_FORWARD_SPEED = 0.4
+CIRCLE_ANG_SPEED     = 0.1       # REVİZE: TURN_SPEED ile aynı büyüklük — doğrudan
+                                 # ang_z komutu, heading PID bypass ediliyor
+                                 # (turn'lerle AYNI mekanizma). NEGATİF = SAĞA döner.
+CIRCLE_TARGET_DEG    = 355.0     # DÜZELTİLDİ: 300'den 355'e alındı (Tam tur hedefleniyor)
+CIRCLE_MAX_TIME      = 45.0      # güvenlik zaman aşımı (sn)
+
+
+def heading_error(current, target):
+    return (target - current + 180.0) % 360.0 - 180.0
+
+
+class State:
+    WAIT_CONTROLLER = 'WAIT_CONTROLLER'
+    DIVING          = 'DIVING'
+    STABILIZING     = 'STABILIZING'
+    LEG_1           = 'LEG_1'
+    WAIT_STOP_1     = 'WAIT_STOP_1'
+    TURN_1          = 'TURN_1'
+    WAIT_SETTLE_1   = 'WAIT_SETTLE_1'
+    LEG_2           = 'LEG_2'
+    WAIT_STOP_2     = 'WAIT_STOP_2'
+    CIRCLE          = 'CIRCLE'
+    WAIT_SETTLE_C   = 'WAIT_SETTLE_C'
+    TURN_C          = 'TURN_C'
+    WAIT_SETTLE_2   = 'WAIT_SETTLE_2'
+    LEG_3           = 'LEG_3'
+    WAIT_STOP_3     = 'WAIT_STOP_3'
+    TURN_2          = 'TURN_2'
+    WAIT_SETTLE_3   = 'WAIT_SETTLE_3'
+    LEG_4           = 'LEG_4'
+    DONE            = 'DONE'
+
+
+class MissionIleriKategori(Node):
+    def __init__(self):
+        super().__init__('mission_ileri_kategori')
+
+        self.cmd_pub        = self.create_publisher(Twist,           '/auv/cmd_vel',         10)
+        self.heading_sp_pub = self.create_publisher(Float32,         '/auv/heading_setpoint', 10)
+        self.motor_pub      = self.create_publisher(Int32MultiArray, '/auv/motor_pwm',        10)
+
+        self.create_subscription(Float32, '/auv/reference_heading', self._ref_heading_cb, 10)
+        self.create_subscription(Float32, '/auv/sensors/heading',   self._heading_cb,     10)
+        self.create_subscription(Float32, '/auv/sensors/depth',     self._depth_cb,       10)
+
+        self.current_heading     = None
+        self.current_depth       = 0.0
+        self.reference_heading   = None
+        self.target_exit_heading = None
+        self.turn_target         = None
+        self.dynamic_heading     = 0.0
+        self.accumulated_yaw     = 0.0
+        self.state               = State.WAIT_CONTROLLER
+        self.timer_start         = 0.0
+
+        self.turn_start_yaw      = 0.0
+        self._turn_confirm       = 0
+
+        # REVİZE: daire için ayrı debounce sayacı
+        self._circle_confirm     = 0
+
+        self.timer = self.create_timer(0.05, self._loop)
+        self.get_logger().info('🚀 İleri Kategori Görevi Başlatıldı')
+
+    def _ref_heading_cb(self, msg: Float32):
+        if self.reference_heading is None:
+            self.reference_heading = (360.0 - msg.data) % 360.0
+            self.get_logger().info(f'✅ Referans alındı: {self.reference_heading:.1f}°')
+            self._set_state(State.DIVING)
+
+    def _heading_cb(self, msg: Float32):
+        new_heading = (360.0 - msg.data) % 360.0
+        if self.current_heading is not None:
+            delta = new_heading - self.current_heading
+            if delta >  180.0: delta -= 360.0
+            if delta < -180.0: delta += 360.0
+            self.accumulated_yaw += delta
+        self.current_heading = new_heading
+
+    def _depth_cb(self, msg: Float32):
+        self.current_depth = msg.data
+
+    def _cmd(self, lin_x=0.0, ang_z=0.0):
+        msg = Twist()
+        msg.linear.x  = lin_x
+        msg.angular.z = ang_z
+        self.cmd_pub.publish(msg)
+
+    def _send_heading_sp(self, angle):
+        msg = Float32()
+        msg.data = float(angle % 360.0)
+        self.heading_sp_pub.publish(msg)
+        self.get_logger().info(f'🎯 Heading setpoint: {msg.data:.1f}°')
+
+    def _set_state(self, new_state):
+        self.state = new_state
+        self.timer_start = time.time()
+        self.get_logger().info(f'🔄 State → {self.state}')
+
+    def _start_right_turn(self, offset_deg: float, next_state: str):
+        self._cmd(0.0, 0.0)
+        self.turn_target    = (self.current_heading + offset_deg) % 360.0
+        self.turn_start_yaw = self.accumulated_yaw
+        self._turn_confirm  = 0
+        self.get_logger().info(
+            f'↪️  offset={offset_deg:+.0f}°  hedef={self.turn_target:.1f}°  '
+            f'mevcut={self.current_heading:.1f}°')
+        self._set_state(next_state)
+
+    def _handle_right_turn(self, next_state: str):
+        err = heading_error(self.current_heading, self.turn_target)
+        turned = self.turn_start_yaw - self.accumulated_yaw
+
+        speed = TURN_SPEED
+        if abs(err) < 30.0:
+            speed = max(0.15, TURN_SPEED * abs(err) / 30.0)
+        ang_z = -speed if err < 0 else +speed
+
+        do_log = (int(time.time() * 2) % 2 == 0)
+        if do_log:
+            self.get_logger().info(
+                f'↪️  {self.state}  heading={self.current_heading:.1f}°  '
+                f'hedef={self.turn_target:.1f}°  err={err:.1f}°  '
+                f'yaw_donulen={turned:.1f}°  ang_z={ang_z:.2f}')
+
+        angle_ok = abs(err) <= HEADING_TOLERANCE
+        yaw_ok   = turned >= (abs(TURN_OFFSET_RIGHT) - HEADING_TOLERANCE)
+
+        if angle_ok and yaw_ok:
+            self._turn_confirm += 1
+        else:
+            self._turn_confirm = 0
+
+        if self._turn_confirm >= TURN_CONFIRM_TICKS:
+            self._cmd(0.0, 0.0)
+            self._send_heading_sp(self.current_heading)
+            self.get_logger().info(
+                f'✅ Dönüş tamamlandı — {self.current_heading:.1f}°  '
+                f'(gerçek dönüş={turned:.1f}°)')
+            self._set_state(next_state)
+        else:
+            self._cmd(0.0, ang_z)
+
+    def _loop(self):
+        if self.current_heading is None:
+            return
+
+        elapsed = time.time() - self.timer_start
+        s = self.state
+
+        if s == State.WAIT_CONTROLLER:
+            self._cmd(0.0, 0.0)
+
+        elif s == State.DIVING:
+            self._cmd(0.0, 0.0)
+            if self.current_depth >= (TARGET_DEPTH - DEPTH_HOLD_MARGIN):
+                self.get_logger().info(f'🔒 Derinlik Tamam: {self.current_depth:.2f}m')
+                self._set_state(State.STABILIZING)
+
+        elif s == State.STABILIZING:
+            self._cmd(0.0, 0.0)
+            if (abs(heading_error(self.current_heading, self.reference_heading)) < HEADING_TOLERANCE
+                    and elapsed > SETTLE_TIME):
+                self.get_logger().info('▶️ LEG_1 başlıyor')
+                self._set_state(State.LEG_1)
+
+        # ---- LEG_1 ---- #
+        elif s == State.LEG_1:
+            self._cmd(FORWARD_SPEED, 0.0)
+            if elapsed >= FORWARD_TIME:
+                self._set_state(State.WAIT_STOP_1)
+
+        elif s == State.WAIT_STOP_1:
+            self._cmd(0.0, 0.0)
+            if elapsed >= SETTLE_TIME:
+                self._start_right_turn(TURN_OFFSET_RIGHT, State.TURN_1)
+
+        elif s == State.TURN_1:
+            self._handle_right_turn(next_state=State.WAIT_SETTLE_1)
+
+        elif s == State.WAIT_SETTLE_1:
+            self._cmd(0.0, 0.0)
+            if elapsed >= SETTLE_TIME:
+                self.get_logger().info('▶️ LEG_2 başlıyor')
+                self._set_state(State.LEG_2)
+
+        # ---- LEG_2 ---- #
+        elif s == State.LEG_2:
+            self._cmd(FORWARD_SPEED, 0.0)
+            if elapsed >= FORWARD_TIME:
+                self._set_state(State.WAIT_STOP_2)
+
+        elif s == State.WAIT_STOP_2:
+            self._cmd(0.0, 0.0)
+            if elapsed >= SETTLE_TIME:
+                self.get_logger().info('🔵 KİNEMATİK DAİRE Başlıyor...')
+                self.accumulated_yaw     = 0.0
+                self._circle_confirm     = 0
+                self.target_exit_heading = self.current_heading
+                self._set_state(State.CIRCLE)
+
+        # ---- CIRCLE ---- #
+        elif s == State.CIRCLE:
+            self._cmd(CIRCLE_FORWARD_SPEED, -CIRCLE_ANG_SPEED)  # NEGATİF = SAĞA
+
+            turned = abs(self.accumulated_yaw)
+
+            do_log = (int(time.time() * 2) % 2 == 0)
+            if do_log:
+                self.get_logger().info(
+                    f'🔵 CIRCLE  dönülen={turned:.1f}°  '
+                    f'mevcut_heading={self.current_heading:.1f}°  '
+                    f'elapsed={elapsed:.1f}s')
+
+            angle_ok = turned >= (CIRCLE_TARGET_DEG - HEADING_TOLERANCE)
+            timeout  = elapsed >= CIRCLE_MAX_TIME
+
+            if angle_ok:
+                self._circle_confirm += 1
+            else:
+                self._circle_confirm = 0
+
+            if self._circle_confirm >= TURN_CONFIRM_TICKS or timeout:
+                if timeout and not angle_ok:
+                    self.get_logger().warn(
+                        f'⚠️ Daire ZAMAN AŞIMINA uğradı! (dönülen={turned:.1f}°, '
+                        f'{CIRCLE_MAX_TIME}s doldu) Yine de devam ediliyor.')
+                else:
+                    self.get_logger().info(
+                        f'✅ Daire Bitti! (dönülen={turned:.1f}°) '
+                        f'Çıkış açısına oturuluyor: {self.target_exit_heading:.1f}°')
+                self._cmd(0.0, 0.0)
+                self._send_heading_sp(self.target_exit_heading)
+                self._set_state(State.WAIT_SETTLE_C)
+
+        elif s == State.WAIT_SETTLE_C:
+            err = heading_error(self.current_heading, self.target_exit_heading)
+            
+            # DÜZELTME: Eğer açı toleransın dışındaysa (örn. 89° fark varsa) 
+            # aracın hedefe aktif olarak dönmesi sağlanıyor.
+            if abs(err) > HEADING_TOLERANCE:
+                speed = TURN_SPEED
+                if abs(err) < 30.0:
+                    speed = max(0.15, TURN_SPEED * abs(err) / 30.0)
+                
+                ang_z = -speed if err < 0 else +speed
+                self._cmd(0.0, ang_z)
+                
+                # Açıya oturana kadar bekleme süresini (SETTLE_TIME) sıfırlıyoruz.
+                self.timer_start = time.time()
+            else:
+                self._cmd(0.0, 0.0)
+                if elapsed >= SETTLE_TIME:
+                    self.get_logger().info('↪️ Daire sonrası sağa 90° dönüş')
+                    self._start_right_turn(TURN_OFFSET_RIGHT, State.TURN_C)
+
+        elif s == State.TURN_C:
+            self._handle_right_turn(next_state=State.WAIT_SETTLE_2)
+
+        elif s == State.WAIT_SETTLE_2:
+            self._cmd(0.0, 0.0)
+            if elapsed >= SETTLE_TIME:
+                self.get_logger().info('▶️ LEG_3 başlıyor')
+                self._set_state(State.LEG_3)
+
+        # ---- LEG_3 ---- #
+        elif s == State.LEG_3:
+            self._cmd(FORWARD_SPEED, 0.0)
+            if elapsed >= FORWARD_TIME_LEG3:
+                self._set_state(State.WAIT_STOP_3)
+
+        elif s == State.WAIT_STOP_3:
+            self._cmd(0.0, 0.0)
+            if elapsed >= SETTLE_TIME:
+                self._start_right_turn(TURN_OFFSET_RIGHT, State.TURN_2)
+
+        elif s == State.TURN_2:
+            self._handle_right_turn(next_state=State.WAIT_SETTLE_3)
+
+        elif s == State.WAIT_SETTLE_3:
+            self._cmd(0.0, 0.0)
+            if elapsed >= SETTLE_TIME:
+                self.get_logger().info('▶️ LEG_4 başlıyor')
+                self._set_state(State.LEG_4)
+
+        # ---- LEG_4 ---- #
+        elif s == State.LEG_4:
+            self._cmd(FORWARD_SPEED, 0.0)
+            if elapsed >= FORWARD_TIME:
+                self.get_logger().info('🏁 Kare Tamamlandı, Kutuya Girildi!')
+                self._set_state(State.DONE)
+
+        elif s == State.DONE:
+            self._cmd(0.0, 0.0)
+            msg = Int32MultiArray()
+            msg.data = [1500] * 8
+            self.motor_pub.publish(msg)
+            
+            # DÜZELTME: Görevi başarıyla ve kalıcı olarak bitirip çıkış yapar
+            self.get_logger().info('✅ Görev Bitti, Motorlar durduruldu (1500). Sistemden çıkılıyor...')
+            sys.exit(0)
+
+
+def main():
+    rclpy.init()
+    node = MissionIleriKategori()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info('🛑 Görev İptal Edildi.')
+        msg = Int32MultiArray()
+        msg.data = [1500] * 8
+        node.motor_pub.publish(msg)
+    except SystemExit:
+        pass  # sys.exit(0) çağrıldığında temiz bir şekilde buraya düşer ve finally'e geçer
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
