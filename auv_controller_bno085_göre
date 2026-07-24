@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AUV Controller (Görev Kodu ile Pusula Yönü Eşitlenmiş Sürüm)
+AUV Controller (Görev Kodu ile Pusula Yönü Eşitlenmiş Sürüm) 
 
 YENİ EKLENEN ÖZELLİK (Hakem Bırakma Yönü Telafisi):
   - 'initial_heading_offset' parametresi.
