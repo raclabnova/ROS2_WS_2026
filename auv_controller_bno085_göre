@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""
+AUV Controller (Görev Kodu ile Pusula Yönü Eşitlenmiş Sürüm)
+
+YENİ EKLENEN ÖZELLİK (Hakem Bırakma Yönü Telafisi):
+  - 'initial_heading_offset' parametresi.
+  - Araç 90 derece SAĞA bırakılırsa offset = -90.0
+  - Araç 90 derece SOLA bırakılırsa offset = +90.0
+  - Görev kodu (mission) ile tamamen aynı olması için pusula okuma yönü
+    (360.0 - msg.data) % 360.0 olarak tersine çevrilmiştir. Hata (Error)
+    hesaplaması da buna uygun olarak reference - current yapılmıştır.
+"""
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32, Int32MultiArray, Bool
+from geometry_msgs.msg import Twist
+import time
+import sys
+
+PITCH_SIGN   = 1.0   # ters düzeltiyorsa -1.0 yap
+ROLL_SIGN    = -1.0  # ters düzeltiyorsa -1.0 yap
+CIRCLE_PWM_H = 1600  # daire modu yatay motor yüksek PWM
+CIRCLE_PWM_L = 1400  # daire modu yatay motor düşük PWM
+
+# Heading setpoint sıçrama eşiği
+HEADING_JUMP_RESET_DEG = 5.0
+
+# Derinlik PID'in motor bütçesini yemesini önleyen sınırlar
+DEPTH_PID_MAX   = 400.0   # pitch/roll'a her zaman pay bırakır
+DEPTH_DERIV_MAX = 1.0     # m/s — türev teriminde ani sıçrama/kick sınırı
+
+
+class AUVController(Node):
+    def __init__(self):
+        super().__init__('auv_controller')
+
+        self.declare_parameter('base_speed',        300)
+        self.declare_parameter('target_depth',      0.60)
+        self.declare_parameter('ref_samples',       20)
+        self.declare_parameter('depth_hold_margin', 0.20)
+        
+        # BAŞLANGIÇ AÇI TELAFİSİ (OFFSET)
+        self.declare_parameter('initial_heading_offset', -90.0)
+
+        self.base_speed         = self.get_parameter('base_speed').value
+        self.target_depth       = self.get_parameter('target_depth').value
+        self.ref_sample_count   = self.get_parameter('ref_samples').value
+        self.depth_hold_margin  = self.get_parameter('depth_hold_margin').value
+        self.initial_heading_offset = self.get_parameter('initial_heading_offset').value
+
+        # ---- Publisher'lar ---- #
+        self.motor_pub = self.create_publisher(
+            Int32MultiArray, '/auv/motor_pwm', 10)
+        self.ref_heading_pub = self.create_publisher(
+            Float32, '/auv/reference_heading', 10)
+
+        # ---- Subscriber'lar ---- #
+        self.create_subscription(Float32, '/auv/sensors/heading',  self._heading_cb,     10)
+        self.create_subscription(Float32, '/auv/sensors/pitch',    self._pitch_cb,       10)
+        self.create_subscription(Float32, '/auv/sensors/roll',     self._roll_cb,        10)
+        self.create_subscription(Float32, '/auv/sensors/depth',    self._depth_cb,       10)
+        self.create_subscription(Twist,   '/auv/cmd_vel',          self._cmd_vel_cb,     10)
+        self.create_subscription(Float32, '/auv/depth_setpoint',   self._depth_sp_cb,    10)
+        self.create_subscription(Float32, '/auv/heading_setpoint', self._heading_sp_cb,  10)
+        self.create_subscription(Bool,    '/auv/circle_mode',      self._circle_mode_cb, 10)
+        self.create_subscription(Bool,    '/auv/shutdown',         self._shutdown_cb,    10)
+
+        # ---- Durum ---- #
+        self.current_heading   = 0.0
+        self.reference_heading = None
+        self._ref_samples      = []
+        self.calibrated        = False
+
+        self.current_depth     = 0.0
+        self.depth_hold_active = False
+        self.circle_mode       = False
+
+        # Pitch ve roll
+        self.current_pitch     = 0.0
+        self.current_roll      = 0.0
+        self.reference_pitch   = None
+        self.reference_roll    = None
+        self._ref_p_samples    = []
+        self._ref_r_samples    = []
+
+        self.lin_x = 0.0
+        self.ang_z = 0.0
+        self.lin_y = 0.0
+        self._prev_ang_z = 0.0
+
+        self.prev_time = time.time()
+
+        # ---- Heading PID ---- #
+        self.h_Kp       = 9.0
+        self.h_Ki       = 0.5   # GÜNCELLENDİ: Sağa çekmeyi uzun vadede yenmesi için I terimi açıldı.
+        self.h_Kd       = 1.0
+        self.h_integral = 0.0
+        self.h_prev_err = 0.0
+
+        # ---- Depth PID ---- #
+        self.d_Kp       = 900.0
+        self.d_Ki       = 5.0
+        self.d_Kd       = 200.0
+        self.d_integral = 0.0
+        self.d_prev_err = 0.0
+
+        # ---- Pitch PID ---- #
+        self.p_Kp       = 6.0
+        self.p_Ki       = 0.0
+        self.p_Kd       = 1.5
+        self.p_integral = 0.0
+        self.p_prev_err = 0.0
+
+        # ---- Roll PID ---- #
+        self.r_Kp       = 2.0
+        self.r_Ki       = 0.5
+        self.r_Kd       = 1.0
+        self.r_integral = 0.0
+        self.r_prev_err = 0.0
+
+        self.timer = self.create_timer(0.02, self._control_loop)
+
+        self.get_logger().info('🚀 AUV Controller başlatıldı (GÖREV KODU İLE EŞİTLENDİ)')
+        self.get_logger().info(f'⚙️  İlk Açı Telafisi (Offset) = {self.initial_heading_offset}°')
+        self.get_logger().info(f'⏳ Kalibrasyon bekleniyor ({self.ref_sample_count} örnek)...')
+
+    # ------------------------------------------------------------------ #
+    #  Callback'ler
+    # ------------------------------------------------------------------ #
+    def _heading_cb(self, msg: Float32):
+        self.current_heading = (360.0 - msg.data) % 360.0
+        
+        if not self.calibrated:
+            self._ref_samples.append(self.current_heading)
+            if len(self._ref_samples) % 5 == 0:
+                self.get_logger().info(
+                    f'📐 Kalibrasyon: {len(self._ref_samples)}/{self.ref_sample_count}')
+            if len(self._ref_samples) >= self.ref_sample_count:
+                raw_reference = self._circular_mean(self._ref_samples)
+                self.reference_heading = (raw_reference - self.initial_heading_offset) % 360.0
+                self.calibrated = True
+                
+                self.get_logger().info(
+                    f'✅ Kalibrasyon bitti. '
+                    f'Okunan İlk Yön: {raw_reference:.1f}° | '
+                    f'Offset: {self.initial_heading_offset}° | '
+                    f'Yeni Kilit Yönü: {self.reference_heading:.1f}°'
+                )
+                self._publish_reference()
+
+    def _pitch_cb(self, msg: Float32):
+        self.current_pitch = msg.data
+        if self.reference_pitch is None:
+            self._ref_p_samples.append(msg.data)
+            if len(self._ref_p_samples) >= self.ref_sample_count:
+                self.reference_pitch = sum(self._ref_p_samples) / len(self._ref_p_samples)
+
+    def _roll_cb(self, msg: Float32):
+        self.current_roll = msg.data
+        if self.reference_roll is None:
+            self._ref_r_samples.append(msg.data)
+            if len(self._ref_r_samples) >= self.ref_sample_count:
+                self.reference_roll = sum(self._ref_r_samples) / len(self._ref_r_samples)
+
+    def _depth_cb(self, msg: Float32):
+        self.current_depth = msg.data
+        if (self.calibrated
+                and not self.depth_hold_active
+                and self.current_depth >= (self.target_depth - self.depth_hold_margin)):
+            self.depth_hold_active = True
+            self.get_logger().info(
+                f'🔒 Depth hold aktif — {self.current_depth:.2f}m  '
+                f'Referans: {self.reference_heading:.1f}°')
+
+    def _cmd_vel_cb(self, msg: Twist):
+        self.lin_x = msg.linear.x
+        self.ang_z = msg.angular.z
+        self.lin_y = msg.linear.y
+
+    def _depth_sp_cb(self, msg: Float32):
+        self.target_depth      = msg.data
+        self.depth_hold_active = False
+
+    def _heading_sp_cb(self, msg: Float32):
+        new_ref = msg.data % 360.0
+        if self.reference_heading is None:
+            self.reference_heading = new_ref
+            self.h_integral        = 0.0
+            self.h_prev_err        = 0.0
+            self._publish_reference()
+            return
+
+        jump = abs(self._heading_error(self.current_heading, new_ref))
+        self.reference_heading = new_ref
+
+        if jump > HEADING_JUMP_RESET_DEG:
+            self.h_integral = 0.0
+            self.h_prev_err = 0.0
+        self._publish_reference()
+
+    def _circle_mode_cb(self, msg: Bool):
+        self.circle_mode = msg.data
+        if self.circle_mode:
+            self.h_integral = 0.0
+            self.h_prev_err = 0.0
+            
+    def _shutdown_cb(self, msg: Bool):
+        if msg.data:
+            self.get_logger().info('🛑 Kapatma komutu alındı! Controller kapatılıyor...')
+            self.stop_motors()
+            sys.exit(0)
+
+    # ------------------------------------------------------------------ #
+    #  Ana kontrol döngüsü
+    # ------------------------------------------------------------------ #
+    def _control_loop(self):
+        if not self.calibrated:
+            return
+
+        self._publish_reference()
+
+        now = time.time()
+        dt  = now - self.prev_time
+        self.prev_time = now
+        if dt < 0.001: dt = 0.02
+
+        # ==============================================================
+        # 1. HEADING PID
+        # ==============================================================
+        if self.circle_mode:
+            pid_out = 0
+        elif self.ang_z != 0.0:
+            pid_out = int(self.ang_z * self.base_speed)
+            self.h_integral = 0.0
+            self.h_prev_err = 0.0
+        elif self._prev_ang_z != 0.0 and self.ang_z == 0.0:
+            self.reference_heading = self.current_heading
+            self.h_integral        = 0.0
+            self.h_prev_err        = 0.0
+            pid_out = 0
+            self._publish_reference()
+            self.get_logger().info(f'🔒 Yaw bitti — yeni referans: {self.reference_heading:.1f}°')
+        elif self.depth_hold_active:
+            err = self._heading_error(self.current_heading, self.reference_heading)
+            self.h_integral += err * dt
+            self.h_integral  = max(min(self.h_integral, 60.0), -60.0)
+            derivative      = (err - self.h_prev_err) / dt
+            self.h_prev_err = err
+            pid_out = (self.h_Kp * err + self.h_Ki * self.h_integral + self.h_Kd * derivative)
+            pid_out = max(min(pid_out, 200.0), -200.0)
+        else:
+            pid_out = 0
+
+        self._prev_ang_z = self.ang_z
+
+        # ==============================================================
+        # 2. DEPTH PID
+        # ==============================================================
+        depth_err = self.target_depth - self.current_depth
+        if abs(depth_err) < 0.05:
+            depth_err       = 0.0
+            self.d_integral = 0.0
+
+        self.d_integral += depth_err * dt
+        self.d_integral  = max(min(self.d_integral, 10.0), -10.0)
+
+        deriv_d = (depth_err - self.d_prev_err) / dt
+        deriv_d = max(min(deriv_d, DEPTH_DERIV_MAX), -DEPTH_DERIV_MAX)
+        self.d_prev_err = depth_err
+
+        depth_pid = (self.d_Kp * depth_err + self.d_Ki * self.d_integral + self.d_Kd * deriv_d)
+        depth_pid = max(min(depth_pid, DEPTH_PID_MAX), -DEPTH_PID_MAX)
+        base_v    = 1500 + int(depth_pid)
+
+        # ==============================================================
+        # 3. PITCH & ROLL PID
+        # ==============================================================
+        pid_pitch = 0.0
+        if self.depth_hold_active and self.reference_pitch is not None:
+            err_p = self.reference_pitch - self.current_pitch
+            self.p_integral += err_p * dt
+            self.p_integral  = max(min(self.p_integral, 60.0), -60.0)
+            deriv_p         = (err_p - self.p_prev_err) / dt
+            self.p_prev_err = err_p
+            pid_pitch = PITCH_SIGN * (self.p_Kp * err_p + self.p_Ki * self.p_integral + self.p_Kd * deriv_p)
+            pid_pitch = max(min(pid_pitch, 300.0), -300.0)
+        else:
+            self.p_integral = 0.0; self.p_prev_err = 0.0
+
+        pid_roll = 0.0
+        if self.depth_hold_active and self.reference_roll is not None:
+            err_r = self.reference_roll - self.current_roll
+            self.r_integral += err_r * dt
+            self.r_integral  = max(min(self.r_integral, 60.0), -60.0)
+            deriv_r         = (err_r - self.r_prev_err) / dt
+            self.r_prev_err = err_r
+            pid_roll = ROLL_SIGN * (self.r_Kp * err_r + self.r_Ki * self.r_integral + self.r_Kd * deriv_r)
+            pid_roll = max(min(pid_roll, 300.0), -300.0)
+        else:
+            self.r_integral = 0.0; self.r_prev_err = 0.0
+
+        # ==============================================================
+        # 4. MOTOR KOMUTLARI (GÜNCELLENDİ - Holonomik Mikser)
+        # ==============================================================
+        pwm_m5 = max(min(base_v - int(pid_pitch) + int(pid_roll), 1900), 1100)
+        pwm_m6 = max(min(base_v + int(pid_pitch) + int(pid_roll), 1900), 1100)
+        pwm_m7 = max(min(base_v - int(pid_pitch) - int(pid_roll), 1900), 1100)
+        pwm_m8 = max(min(base_v + int(pid_pitch) - int(pid_roll), 1900), 1100)
+
+        msg = Int32MultiArray()
+
+        if self.circle_mode:
+            msg.data = [CIRCLE_PWM_H, CIRCLE_PWM_L, CIRCLE_PWM_L, CIRCLE_PWM_H, pwm_m5, pwm_m6, pwm_m7, pwm_m8]
+        else:
+            # Artık İleri (base_x), Yengeç (strafe) ve Dönüş (yaw) aynı anda karıştırılarak basılıyor.
+            base_x = int(self.lin_x * self.base_speed)
+            strafe = int(self.lin_y * self.base_speed)
+            yaw    = int(pid_out)
+
+            m1 = max(min(1500 + base_x + strafe + yaw, 1900), 1100) # Sağ Ön
+            m2 = max(min(1500 + base_x - strafe - yaw, 1900), 1100) # Sol Ön
+            m3 = max(min(1500 + base_x - strafe + yaw, 1900), 1100) # Sağ Arka
+            m4 = max(min(1500 + base_x + strafe - yaw, 1900), 1100) # Sol Arka
+
+            msg.data = [m1, m2, m3, m4, pwm_m5, pwm_m6, pwm_m7, pwm_m8]
+
+        self.motor_pub.publish(msg)
+
+        if int(now * 2) % 2 == 0:
+            hold_str = '🔒HOLD' if self.depth_hold_active else '⏳bekle'
+            self.get_logger().info(
+                f'{hold_str} | YAW {self.current_heading:.1f}→{self.reference_heading:.1f}° '
+                f'PID={pid_out:.1f} | D {self.current_depth:.2f}→{self.target_depth:.2f}m '
+            )
+
+    def _publish_reference(self):
+        if self.reference_heading is not None:
+            msg      = Float32()
+            msg.data = float(self.reference_heading)
+            self.ref_heading_pub.publish(msg)
+
+    @staticmethod
+    def _heading_error(current: float, reference: float) -> float:
+        err = reference - current
+        if err >  180.0: err -= 360.0
+        if err < -180.0: err += 360.0
+        return err
+
+    @staticmethod
+    def _circular_mean(angles: list) -> float:
+        import math
+        sin_sum = sum(math.sin(math.radians(a)) for a in angles)
+        cos_sum = sum(math.cos(math.radians(a)) for a in angles)
+        return math.degrees(math.atan2(sin_sum, cos_sum)) % 360.0
+
+    def stop_motors(self):
+        stop_msg      = Int32MultiArray()
+        stop_msg.data = [1500] * 8
+        for _ in range(10):
+            self.motor_pub.publish(stop_msg)
+            time.sleep(0.05)
+
+
+def main():
+    time.sleep(96)
+    rclpy.init()
+    node = AUVController()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info('🛑 Controller kapatılıyor...')
+        node.stop_motors()
+    except SystemExit:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
