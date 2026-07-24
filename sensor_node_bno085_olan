@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""
+sensor_node.py — BNO085 (UART-RVC) IMU + MS5837 Basınç + WaterLinked DVL A50
+-----------------------------------------------------------------------------
+DEĞİŞİKLİK: BNO055 → BNO085 (UART-RVC modu)
+  - adafruit_bno055 kütüphanesi kaldırıldı (BNO085 UART-RVC ile uyumsuz,
+    farklı bir binary protokol kullanıyor).
+  - UART-RVC frame parser bu dosyaya doğrudan gömüldü (harici node/paket
+    gerekmiyor, tek node her şeyi yapıyor — eski mimari korundu).
+  - Donanım bağlantısı: BNO085 PS0=3.3V, PS1=GND (UART-RVC modu), SDA(TX)
+    → USB-UART adaptör RX, GND ortak. Detaylar bno085_uart README'sinde.
+
+FİZİKSEL EKSEN DÜZELTMESİ (GÜNCELLEME):
+  - IMU'nun montaj yönünden dolayı Pitch ve Roll eksenleri yer değiştirildi. 
+    Frame'den gelen 5:7 byte'ları artık Roll, 7:9 byte'ları ise Pitch olarak okunuyor.
+
+UART-RVC frame formatı (Hillcrest/CEVA BNO08x datasheet):
+  19 byte, 115200 baud, ~100Hz sürekli akış:
+    [0]     0xAA
+    [1]     0xAA
+    [2]     Index (0-255, her frame'de artar)
+    [3:5]   Yaw   (int16 LE, 0.01°/LSB, 0-359.99°)
+    [5:7]   Pitch (Aslen Pitch, ama kodda Roll'a atandı)
+    [7:9]   Roll  (Aslen Roll, ama kodda Pitch'e atandı)
+    [9:11]  X ivme (kullanılmıyor)
+    [11:13] Y ivme (kullanılmıyor)
+    [13:15] Z ivme (kullanılmıyor)
+    [15:18] Reserved
+    [18]    Checksum = sum(byte[2:18]) & 0xFF
+
+Yayınlanan topic'ler (DEĞİŞMEDİ):
+  /auv/sensors/heading      (Float32, derece 0-360)   ← Yaw
+  /auv/sensors/pitch        (Float32, derece)
+  /auv/sensors/roll         (Float32, derece)
+  /auv/sensors/depth        (Float32, metre)
+  /auv/sensors/temperature  (Float32, °C)
+  /auv/sensors/dvl_vx       (Float32, m/s — body frame)
+  /auv/sensors/dvl_vy       (Float32, m/s — body frame)
+  /auv/sensors/dvl_pos_x    (Float32, m — dead reckoning global)
+  /auv/sensors/dvl_pos_y    (Float32, m — dead reckoning global)
+"""
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32
+import serial
+import struct
+import ms5837
+import socket
+import json
+import threading
+import time
+
+DVL_IP            = '192.168.194.95'
+DVL_PORT          = 16171
+DVL_FOM_THRESHOLD = 0.2   # havuz zemini için toleranslı (eski: 0.1)
+
+# BNO085 UART-RVC frame sabitleri
+RVC_FRAME_LEN = 19
+RVC_HEADER    = 0xAA
+
+
+class SensorNode(Node):
+    def __init__(self):
+        super().__init__('sensor_node')
+
+        # Publisher'lar
+        self.heading_pub   = self.create_publisher(Float32, '/auv/sensors/heading',     10)
+        self.pitch_pub     = self.create_publisher(Float32, '/auv/sensors/pitch',       10)
+        self.roll_pub      = self.create_publisher(Float32, '/auv/sensors/roll',        10)
+        self.depth_pub     = self.create_publisher(Float32, '/auv/sensors/depth',       10)
+        self.temp_pub      = self.create_publisher(Float32, '/auv/sensors/temperature', 10)
+        self.dvl_vx_pub    = self.create_publisher(Float32, '/auv/sensors/dvl_vx',      10)
+        self.dvl_vy_pub    = self.create_publisher(Float32, '/auv/sensors/dvl_vy',      10)
+        self.dvl_pos_x_pub = self.create_publisher(Float32, '/auv/sensors/dvl_pos_x',   10)
+        self.dvl_pos_y_pub = self.create_publisher(Float32, '/auv/sensors/dvl_pos_y',   10)
+
+        # IMU (BNO085 UART-RVC)
+        self.declare_parameter('imu_port', '/dev/ttyUSB0')
+        self.imu_port_name = self.get_parameter('imu_port').value
+        self.imu_serial = None
+        self._imu_buf   = bytearray()
+        self._init_imu()
+
+        # Basınç sensörü
+        self.declare_parameter('i2c_bus',       7)
+        self.declare_parameter('fluid_density', 1025.0)
+        self.bus              = self.get_parameter('i2c_bus').value
+        self.density          = self.get_parameter('fluid_density').value
+        self.surface_pressure = None
+        self.pressure_sensor  = None
+        self._init_pressure_sensor()
+
+        # DVL thread
+        threading.Thread(target=self._dvl_loop, daemon=True).start()
+        self.get_logger().info('✅ DVL thread başlatıldı')
+
+        # 10 Hz timer — IMU UART buffer taşmasını önler
+        self.timer = self.create_timer(0.1, self.read_sensors)
+        self.get_logger().info('🚀 Sensor node başlatıldı')
+
+    # ── IMU (BNO085 UART-RVC) ────────────────────────────────────────────
+    def _init_imu(self):
+        try:
+            # timeout=0 → non-blocking read, in_waiting ile birlikte kullanılıyor
+            self.imu_serial = serial.Serial(self.imu_port_name, 115200, timeout=0)
+            self._imu_buf = bytearray()
+            time.sleep(0.3)
+            self.get_logger().info(f'✅ BNO085 (UART-RVC) portu açıldı: {self.imu_port_name}')
+        except Exception as e:
+            self.get_logger().error(f'❌ BNO085 hata: {e}')
+            self.imu_serial = None
+
+    def _read_imu(self):
+        """
+        Serial buffer'daki tüm hazır byte'ları okuyup UART-RVC frame'lerini
+        parse eder. Birden fazla frame varsa en güncelini döner (eskileri atar,
+        buffer'ın şişip gecikme yaratmasını önler).
+
+        Dönüş: (yaw, pitch, roll) tuple veya yeni geçerli frame yoksa None.
+        """
+        n = self.imu_serial.in_waiting
+        if n:
+            self._imu_buf += self.imu_serial.read(n)
+
+        latest = None
+        # Buffer'da en az bir tam frame kalana kadar tara
+        while len(self._imu_buf) >= RVC_FRAME_LEN:
+            if self._imu_buf[0] == RVC_HEADER and self._imu_buf[1] == RVC_HEADER:
+                frame = self._imu_buf[:RVC_FRAME_LEN]
+                checksum_calc = sum(frame[2:18]) & 0xFF
+                checksum_recv = frame[18]
+
+                if checksum_calc == checksum_recv:
+                    yaw   = struct.unpack('<h', frame[3:5])[0] * 0.01
+                    
+                    # ---- DEĞİŞİKLİK BURADA: PITCH VE ROLL EKSENLERİ YER DEĞİŞTİRİLDİ ----
+                    roll  = struct.unpack('<h', frame[5:7])[0] * 0.01  # Aslen Pitch byte'ları
+                    pitch = struct.unpack('<h', frame[7:9])[0] * 0.01  # Aslen Roll byte'ları
+                    # ---------------------------------------------------------------------
+
+                    latest = (yaw % 360.0, pitch, roll)
+                    self._imu_buf = self._imu_buf[RVC_FRAME_LEN:]
+                else:
+                    # Checksum tutmadı → senkron bozulmuş, 1 byte kaydır ve tekrar dene
+                    self._imu_buf = self._imu_buf[1:]
+            else:
+                # Header eşleşmedi → 1 byte kaydır (resync)
+                self._imu_buf = self._imu_buf[1:]
+
+        return latest
+
+    # ── Basınç sensörü ────────────────────────────────────────────────────
+    def _init_pressure_sensor(self):
+        try:
+            self.pressure_sensor = ms5837.MS5837_30BA(bus=self.bus)
+            if not self.pressure_sensor.init():
+                raise RuntimeError('MS5837 init başarısız')
+            self.pressure_sensor.setFluidDensity(self.density)
+            self.pressure_sensor.read()
+            self.surface_pressure = self.pressure_sensor.pressure()
+            self.get_logger().info(
+                f'✅ MS5837 başlatıldı — Referans: {self.surface_pressure:.2f} mbar')
+        except Exception as e:
+            self.get_logger().error(f'❌ MS5837 hata: {e}')
+            self.pressure_sensor = None
+
+    # ── Sensör okuma (10 Hz) ──────────────────────────────────────────────
+    def read_sensors(self):
+        # IMU
+        if self.imu_serial:
+            try:
+                result = self._read_imu()
+                if result is not None:
+                    yaw, pitch, roll = result
+
+                    msg = Float32(); msg.data = float(yaw)
+                    self.heading_pub.publish(msg)
+
+                    msg = Float32(); msg.data = float(roll)
+                    self.roll_pub.publish(msg)
+
+                    msg = Float32(); msg.data = float(pitch)
+                    self.pitch_pub.publish(msg)
+            except Exception as e:
+                self.get_logger().warn(
+                    f'IMU okuma hatası: {e} — yeniden başlatılıyor...')
+                try:
+                    self.imu_serial.close()
+                except Exception:
+                    pass
+                self.imu_serial = None
+                threading.Thread(target=self._init_imu, daemon=True).start()
+
+        # Basınç / derinlik
+        if self.pressure_sensor:
+            try:
+                if self.pressure_sensor.read():
+                    current_p   = self.pressure_sensor.pressure()
+                    temperature = self.pressure_sensor.temperature()
+                    delta_pa    = (current_p - self.surface_pressure) * 100.0
+                    depth       = max(0.0, delta_pa / (self.density * 9.80665))
+
+                    depth_msg      = Float32(); depth_msg.data = float(depth)
+                    self.depth_pub.publish(depth_msg)
+
+                    temp_msg       = Float32(); temp_msg.data = float(temperature)
+                    self.temp_pub.publish(temp_msg)
+            except Exception as e:
+                self.get_logger().warn(f'Basınç hatası: {e}')
+                time.sleep(0.5)
+                self._init_pressure_sensor()
+
+    # ── DVL TCP döngüsü ───────────────────────────────────────────────────
+    def _dvl_loop(self):
+        while rclpy.ok():
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5.0)
+                sock.connect((DVL_IP, DVL_PORT))
+                self.get_logger().info(
+                    f'✅ DVL TCP bağlandı ({DVL_IP}:{DVL_PORT})')
+
+                # Dead reckoning sıfırla
+                reset_cmd = json.dumps({'command': 'reset_dead_reckoning'}) + '\n'
+                sock.sendall(reset_cmd.encode())
+                self.get_logger().info('✅ DVL dead reckoning sıfırlandı')
+
+                # Veri al
+                sock.settimeout(3.0)
+                buffer = ''
+                while rclpy.ok():
+                    try:
+                        data = sock.recv(4096).decode('utf-8', errors='ignore')
+                    except socket.timeout:
+                        self.get_logger().warn(
+                            'DVL veri timeout — yeniden bağlanıyor',
+                            throttle_duration_sec=5.0)
+                        break
+                    if not data:
+                        break
+                    buffer += data
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            d = json.loads(line)
+                            self._process_dvl(d)
+                        except json.JSONDecodeError:
+                            pass
+
+            except Exception as e:
+                self.get_logger().warn(
+                    f'DVL bağlantı hatası: {e} — 3sn sonra tekrar',
+                    throttle_duration_sec=5.0)
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                time.sleep(3.0)
+
+    # ── DVL veri işleme ───────────────────────────────────────────────────
+    def _process_dvl(self, d):
+        msg_type = d.get('type', '')
+
+        if msg_type == 'velocity':
+            if not d.get('velocity_valid', False):
+                return
+            if d.get('fom', 999.0) > DVL_FOM_THRESHOLD:
+                return
+            vx = Float32(); vx.data = float(d['vx'])
+            vy = Float32(); vy.data = float(d['vy'])
+            self.dvl_vx_pub.publish(vx)
+            self.dvl_vy_pub.publish(vy)
+
+        elif msg_type == 'position_local':
+            if d.get('status', 1) != 0:
+                return
+            px = Float32(); px.data = float(d['x'])
+            py = Float32(); py.data = float(d['y'])
+            self.dvl_pos_x_pub.publish(px)
+            self.dvl_pos_y_pub.publish(py)
+
+
+def main(args=None):
+    time.sleep(80)
+    rclpy.init(args=args)
+    node = SensorNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info('🛑 Sensor node durduruldu')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
